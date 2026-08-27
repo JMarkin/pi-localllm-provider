@@ -91,7 +91,7 @@ No — every configured server re-registers automatically on startup.
 | MTPLX | `GET /health` | context window, max tokens, reasoning, vision |
 | oMLX | `GET /v1/models/status` | + loaded state, size |
 | LM Studio | `GET /api/v1/models` | + loaded state, size, quantization |
-| llama.cpp (`llama-server`) | `GET /props` + `/v1/models` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id |
+| llama.cpp (`llama-server`) | `GET /props` + `/v1/models` + `POST /apply-template` | context window (`n_ctx`, falls back to `n_ctx_train`), vision, size, `--alias` id, reasoning and request compat — both measured, see note |
 | SGLang | `GET /model_info` + `/server_info` + `/v1/models` | context window, reasoning, vision, measured request compat — see note |
 | Ollama (native API) | `/api/tags` + `/api/show` per model + `/api/ps` | context window, reasoning, vision, size, quantization, loaded state |
 | vLLM | `GET /version` + `/v1/models` | context window only — see note |
@@ -136,6 +136,16 @@ Levels the model rejects are then mapped to the nearest one it accepts, ties goi
 
 Without that map, three of Pi's seven levels would 400. If the server can't be reached or answers nothing, no `compat` is recorded at all — an unanswered probe isn't evidence against a convention, so it degrades to the same safe defaults every other backend uses.
 
+**llama.cpp reports no reasoning flag, so it is measured too.** `/props` says a lot — context, modalities, the chat template's source and its `chat_template_caps` — but not the one thing that decides `reasoning`: whether that template has a thinking switch. `llama-server` works this out for itself at startup (`common_chat_templates_support_enable_thinking`) and never puts the answer on the API. What it does put on the API is the renderer itself: `POST /apply-template` runs the full chat-completions request parse, `chat_template_kwargs` and `reasoning_effort` included, and returns the prompt it would have generated from, without generating. So the detector renders one throwaway user turn three times:
+
+- with `enable_thinking: true` forced through `chat_template_kwargs`
+- with `enable_thinking: false` forced the same way
+- with neither, which is whatever the server was started with
+
+If the two forced renders come out identical, the template has no switch and the model registers as non-reasoning. If they differ, the unforced render shows which side the server sits on: a `--reasoning off` server renders like the disabled case and registers as non-reasoning too, because that is the state every request from Pi will run in — Pi can send `reasoning_effort`, but not `chat_template_kwargs`, so nothing it sends could turn thinking back on. Only a server that thinks by default registers as reasoning. One field that looks like it should help is deliberately ignored: `/props` reports `default_generation_settings.params.reasoning_format` as `none` on a server that is splitting `reasoning_content` out of every reply, because that block is built from default parser settings rather than the server's flags.
+
+The tier sweep reuses the same endpoint, which makes it free where SGLang's costs a token per accepted tier. `llama-server` handles `"none"` itself — it flips `enable_thinking` off and never shows the template the value — and hands every other tier to the template as `reasoning_effort`, where a Qwen3.8 template rejects the ones it doesn't know exactly as it does under SGLang. One difference matters: a template `raise` comes back as a **500**, not a 400, with the raise message in the error body. A bare status can't tell that from a broken server, so the detector reads the body and counts only a 500 quoting a `Jinja Exception` as a rejection. Anything else is an unanswered tier, and one of those discards the sweep, for the same reason as on SGLang. A template that never reads `reasoning_effort` accepts every tier and acts on none of them; that registers as an identity map, and `off → "none"` still works on it, since that entry is implemented by the server rather than the template.
+
 vLLM's `/v1/models` never carries reasoning or vision data; its detector exists only to label the backend `[vLLM]` correctly, not to unlock extra metadata.
 
 **Known limitation — vLLM vision/reasoning.** Nothing in vLLM's public API says whether the served model supports images or reasoning, so both always come back `false`/text-only for `[vLLM]` servers, even for VLMs. (vLLM does have an internal `/server_info` debug endpoint that carries this, gated behind a `VLLM_SERVER_DEV_MODE=1` env var — but it's undocumented, dumps your full server config on request, and its system-info collection is known to crash on some setups, so this extension deliberately doesn't probe it.) If a tag is wrong for your model, use **✎ Edit model capabilities** in the server's sub-menu to flip vision/reasoning by hand — same effect as editing `settings.json` directly, just without leaving Pi. It survives until the next **↺ Refresh**, which overwrites it with whatever the server reports.
@@ -148,7 +158,7 @@ vLLM's `/v1/models` never carries reasoning or vision data; its detector exists 
 
 Flipping `reasoning` to `true` (auto-detected or by hand) only changes how *responses* are parsed. This extension disables Pi's OpenAI o1-style reasoning-model conventions — the `reasoning_effort` request param and `developer`-role system prompts — by default for every model it registers, since most detection paths above can't confirm the server speaks either convention. So toggling reasoning on is safe to try even against a server that doesn't really support it: nothing about the outgoing request changes because of it.
 
-ds4 is the one exception, and only because both conventions were confirmed in its source: it parses `reasoning_effort` on the chat path, and accepts the `developer` role wherever it accepts `system`. Both are enabled for `[ds4]` models, which is what lets Pi's thinking levels actually reach the server. Hand-edited models and servers configured before this existed keep the safe defaults.
+The exceptions are the backends that could prove it. ds4, because both conventions were confirmed in its source: it parses `reasoning_effort` on the chat path, and accepts the `developer` role wherever it accepts `system`. SGLang, ninfer and llama.cpp, because each is measured against the loaded template, as described above. Those enable both conventions on evidence, which is what lets Pi's thinking levels actually reach the server. Hand-edited models and servers configured before this existed keep the safe defaults.
 
 ### ninfer publishes nothing, so everything is measured
 
@@ -172,7 +182,7 @@ The whole detection, 600 KB probe body included, takes under 400 ms.
 
 Worth understanding before reading anything into the status bar, because the interesting cases are the ones where Pi and the server disagree.
 
-While `supportsReasoningEffort` is off — the default for every backend except ds4 — Pi never sends `reasoning_effort` at all, so the server keeps using whatever it defaults to internally and the level shown in Pi has no effect on it whatsoever. Turning it on is what connects the two for the first time. That can look like a regression: a server quietly running at its own default now follows the session instead. It isn't one — it's the first time the setting was ever wired up.
+While `supportsReasoningEffort` is off — the default everywhere it has not been confirmed or measured — Pi never sends `reasoning_effort` at all, so the server keeps using whatever it defaults to internally and the level shown in Pi has no effect on it whatsoever. Turning it on is what connects the two for the first time. That can look like a regression: a server quietly running at its own default now follows the session instead. It isn't one — it's the first time the setting was ever wired up.
 
 ds4 recognises only three modes internally (`think_mode_from_enabled` in `ds4_server.c`) — off, high, and max — so Pi's seven levels don't map one-to-one. Two of them would land somewhere surprising without help:
 

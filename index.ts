@@ -183,9 +183,10 @@ function registerServer(pi: ExtensionAPI, server: LLMServer): void {
       // nothing about the outgoing request changes because of it.
       //
       // A detector may opt a model back in via `compat`, but only on
-      // evidence: ds4 by having had its source read, SGLang and ninfer by
-      // measuring the server directly, since their accepted values belong to
-      // the loaded chat template rather than to the backend (see detect.ts).
+      // evidence: ds4 by having had its source read; SGLang, ninfer and
+      // llama.cpp by measuring the server directly, since their accepted
+      // values belong to the loaded chat template rather than to the backend
+      // (see detect.ts).
       // The defaults stay off for everything else, including hand-edited
       // models and servers configured before this field existed.
       //

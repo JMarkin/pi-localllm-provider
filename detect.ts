@@ -298,10 +298,22 @@ export async function detectLmStudio(
 
 // ─── llama.cpp server (llama-server) ───────────────────────────────
 // /props has the runtime-configured context (n_ctx) and vision support;
-// /v1/models has the id (respects --alias), the model's trained max
-// context (n_ctx_train) as a fallback ceiling, and file size. No
-// loaded/unloaded distinction exists — one server process, one model —
-// so loaded is left undefined, same as the generic OpenAI probe.
+// /v1/models has the id (respects
+// --alias), the model's trained max context (n_ctx_train) as a fallback
+// ceiling, and file size. No loaded/unloaded distinction exists — one
+// server process, one model — so loaded is left undefined, same as the
+// generic OpenAI probe.
+//
+// Nothing in /props says whether the model thinks. The template
+// capabilities it reports (chat_template_caps) cover tools, system role
+// and reasoning_effort, but the "does this template have a thinking
+// switch" answer that llama-server computes for itself at startup
+// (common_chat_templates_support_enable_thinking) never reaches the API.
+// So it is measured, through POST /apply-template — the server's own
+// template renderer, which runs the full chat-completions request parse
+// (chat_template_kwargs, reasoning_effort, everything) and returns the
+// prompt it would have generated from, without generating. See
+// probeLlamaCppThinking for what gets rendered and compared.
 
 interface LlamaCppProps {
   default_generation_settings?: { n_ctx?: number };
@@ -331,6 +343,13 @@ export async function detectLlamaCpp(
     props.default_generation_settings.n_ctx || entry?.meta?.n_ctx_train || 32768;
   const id = entry?.id ?? props.model_path;
 
+  // Not consulted: default_generation_settings.params.reasoning_format.
+  // It reads "none" on a server that is splitting reasoning_content out of
+  // every reply — /props builds that block from a default-constructed
+  // task_params and only copies the sampling settings in, so the parser
+  // fields never reflect the flags the server was started with.
+  const thinking = await probeLlamaCppThinking(root, apiKey, signal);
+
   return {
     apiType: "llamacpp",
     models: [
@@ -338,12 +357,110 @@ export async function detectLlamaCpp(
         id,
         name: id.split(/[\\/]/).pop() ?? id,
         contextWindow,
-        maxTokens: capTokens(contextWindow),
-        reasoning: false,
+        maxTokens: capTokens(contextWindow, thinking.reasoning),
+        reasoning: thinking.reasoning,
         input: props.modalities?.vision ? ["text", "image"] : ["text"],
         sizeBytes: firstNumber(entry?.meta?.size),
+        ...(thinking.compat ? { compat: thinking.compat } : {}),
+        ...(thinking.thinkingLevelMap ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
       },
     ],
+  };
+}
+
+// ─── llama.cpp thinking probe ───────────────────────────────────────
+// Three renders of the same one-line conversation through /apply-template
+// answer the question /props can't:
+//
+//   - with chat_template_kwargs.enable_thinking = true
+//   - with chat_template_kwargs.enable_thinking = false
+//   - with neither, i.e. whatever the server defaults to
+//
+// A template with a thinking switch renders the two forced cases
+// differently (Qwen3 closes an empty <think></think> block into the
+// generation prompt when thinking is off; GPT-OSS changes its system
+// preamble). Identical output means the switch isn't there, and the model
+// is registered as non-reasoning. When the switch exists, the unforced
+// render says which side the server sits on — `--reasoning off` makes it
+// match the disabled case — and only a server that thinks by default is
+// registered as reasoning, since that is the state every request from Pi
+// will actually run in: Pi can send reasoning_effort, but not
+// chat_template_kwargs, so it has no way to turn thinking on against a
+// server that was started with it off.
+//
+// The reasoning_effort sweep runs through the same endpoint, and is free
+// where SGLang's costs a token per accepted tier: /apply-template stops
+// after rendering. llama-server handles "none" itself (it flips
+// enable_thinking off and never shows the template the value), and hands
+// every other tier to the template as the reasoning_effort variable. A
+// template that validates the value raises, and llama-server turns a Jinja
+// raise into a 500 — not a 400 — with the raise message in the error body.
+// The status alone can't tell that apart from a broken server, so the
+// body is read: only a 500 that quotes a template exception counts as
+// "rejected". Anything else is unanswered, and one unanswered tier
+// discards the sweep, for the same reason as in probeRequestCompat.
+//
+// A template that never reads reasoning_effort accepts every tier and
+// applies none of them; that shows up as an identity map, exactly as it
+// does on SGLang, and the "none" entry is still real because llama-server
+// implements that one without the template's help.
+
+const TEMPLATE_RAISE = /Jinja Exception|Error executing/;
+
+function classifyTemplateReply(reply: ProbeReply | null): "accepted" | "rejected" | "unanswered" {
+  if (!reply) return "unanswered";
+  if (reply.status === 200) return "accepted";
+  if (reply.status === 400 || reply.status === 422) return "rejected";
+  if (reply.status === 500 && TEMPLATE_RAISE.test(reply.body)) return "rejected";
+  return "unanswered";
+}
+
+function renderedPrompt(reply: ProbeReply | null): string | undefined {
+  if (reply?.status !== 200) return undefined;
+  try {
+    const prompt = (JSON.parse(reply.body) as { prompt?: unknown }).prompt;
+    return typeof prompt === "string" ? prompt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function probeLlamaCppThinking(
+  root: string,
+  apiKey: string,
+  signal?: AbortSignal,
+): Promise<{ reasoning: boolean } & RequestCompat> {
+  const url = `${root}/apply-template`;
+  const user = { role: "user", content: "hi" };
+  const render = (extra: Record<string, unknown>) =>
+    probe(url, apiKey, { messages: [user], ...extra }, signal);
+
+  const [byDefault, forcedOn, forcedOff] = (
+    await Promise.all([
+      render({}),
+      render({ chat_template_kwargs: { enable_thinking: true } }),
+      render({ chat_template_kwargs: { enable_thinking: false } }),
+    ])
+  ).map(renderedPrompt);
+
+  // A render that didn't come back is not evidence of anything; the safe
+  // default (no thinking, no compat) is what a missing answer degrades to.
+  if (byDefault === undefined || forcedOn === undefined || forcedOff === undefined) {
+    return { reasoning: false };
+  }
+  if (forcedOn === forcedOff || byDefault !== forcedOn) return { reasoning: false };
+
+  const [tierReplies, developerReply] = await Promise.all([
+    Promise.all(THINKING_TIERS.map((tier) => render({ reasoning_effort: tier }))),
+    render({ messages: [{ role: "developer", content: "You are terse." }, user] }),
+  ]);
+  const verdicts = tierReplies.map(classifyTemplateReply);
+  if (verdicts.some((v) => v === "unanswered")) return { reasoning: true };
+
+  const accepted = THINKING_TIERS.filter((_, i) => verdicts[i] === "accepted");
+  return {
+    reasoning: true,
+    ...compatFromSweep(accepted, classifyTemplateReply(developerReply) === "accepted"),
   };
 }
 
@@ -579,12 +696,18 @@ export async function probeRequestCompat(
   if (!tierStatuses.every(isDefinitive)) return {};
 
   const accepted = THINKING_TIERS.filter((_, i) => tierStatuses[i] === 200);
+  // The developer probe is held to a lower bar because its unknown state
+  // is already the safe one: false just means Pi keeps sending "system".
+  return compatFromSweep(accepted, developerStatus === 200);
+}
 
+// Turns a finished sweep — the tiers the server accepted, and whether it
+// took the developer role — into what gets registered. Shared by every
+// backend that measures its levels, so they all map the same way.
+function compatFromSweep(accepted: readonly string[], developerAccepted: boolean): RequestCompat {
   const result: RequestCompat = {};
   if (accepted.length > 0) {
-    // The developer probe is held to a lower bar because its unknown state
-    // is already the safe one: false just means Pi keeps sending "system".
-    result.compat = { supportsReasoningEffort: true, supportsDeveloperRole: developerStatus === 200 };
+    result.compat = { supportsReasoningEffort: true, supportsDeveloperRole: developerAccepted };
 
     const map: Partial<Record<ThinkingLevel, string>> = {};
     // Only claim "off" when the server really has an off switch; otherwise
@@ -597,7 +720,7 @@ export async function probeRequestCompat(
       if (tier) map[level] = tier;
     }
     if (Object.keys(map).length > 0) result.thinkingLevelMap = map;
-  } else if (developerStatus === 200) {
+  } else if (developerAccepted) {
     result.compat = { supportsDeveloperRole: true };
   }
   return result;

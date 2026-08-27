@@ -356,6 +356,156 @@ describe("detectLlamaCpp", () => {
   });
 });
 
+// A llama-server whose /apply-template answers. Each render is resolved
+// from the request body: the two forced enable_thinking cases and the
+// unforced one return the prompt named in `prompts`; a reasoning_effort
+// tier returns the status in `tiers` (default 200), where a 500 carries
+// the Jinja raise message the server really emits; "__developer__" is the
+// role probe. A missing `prompts` leaves /apply-template unrouted.
+interface LlamaCppTemplate {
+  prompts?: { byDefault: string; on: string; off: string };
+  tiers?: Record<string, number | "network-error">;
+  developer?: number;
+}
+
+const TEMPLATE_RAISE_BODY =
+  '{"error":{"code":500,"message":"\\nError executing statement at position 1234: Jinja Exception: Unexpected reasoning effort high.","type":"server_error"}}';
+
+function mockLlamaCpp(template: LlamaCppTemplate, props: Record<string, unknown> = {}) {
+  const routes: Record<string, unknown> = {
+    "http://x/props": {
+      default_generation_settings: { n_ctx: 32768 },
+      model_path: "/models/Qwen3.8-27B-Q4_K_M.gguf",
+      ...props,
+    },
+    "http://x/v1/models": { data: [{ id: "/models/Qwen3.8-27B-Q4_K_M.gguf" }] },
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u.endsWith("/apply-template") && template.prompts) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const reply = (status: number, text: string) =>
+          ({ ok: status === 200, status, text: async () => text, json: async () => ({}) }) as unknown as Response;
+        if ((body.messages ?? []).some((m: { role: string }) => m.role === "developer")) {
+          return reply(template.developer ?? 200, "");
+        }
+        if (typeof body.reasoning_effort === "string") {
+          const status = template.tiers?.[body.reasoning_effort] ?? 200;
+          if (status === "network-error") throw new Error("connection refused");
+          return reply(status, status === 500 ? TEMPLATE_RAISE_BODY : "");
+        }
+        const enable = body.chat_template_kwargs?.enable_thinking;
+        const prompt =
+          enable === true ? template.prompts.on : enable === false ? template.prompts.off : template.prompts.byDefault;
+        return reply(200, JSON.stringify({ prompt }));
+      }
+      if (u in routes) return { ok: true, status: 200, json: async () => routes[u] } as unknown as Response;
+      return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+    }),
+  );
+}
+
+// Qwen3's generation prompt, with and without the empty think block the
+// template closes when thinking is disabled.
+const QWEN3_THINKING = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n";
+const QWEN3_NO_THINKING = `${QWEN3_THINKING}<think>\n\n</think>\n\n`;
+
+// The tiers a Qwen3.8 template accepts, reached through llama-server this
+// time: "none" is handled by the server before the template sees it, and
+// a rejected tier is a Jinja raise, which llama-server reports as a 500.
+const QWEN38_TEMPLATE_TIERS = { minimal: 500, high: 500, max: 500 };
+
+describe("detectLlamaCpp thinking", () => {
+  it("registers a thinking template as reasoning and measures its levels", async () => {
+    mockLlamaCpp({
+      prompts: { byDefault: QWEN3_THINKING, on: QWEN3_THINKING, off: QWEN3_NO_THINKING },
+      tiers: QWEN38_TEMPLATE_TIERS,
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0]).toMatchObject({
+      reasoning: true,
+      maxTokens: 16384,
+      compat: { supportsReasoningEffort: true, supportsDeveloperRole: true },
+      thinkingLevelMap: {
+        off: "none",
+        minimal: "low",
+        low: "low",
+        medium: "medium",
+        high: "medium",
+        xhigh: "xhigh",
+        max: "xhigh",
+      },
+    });
+  });
+
+  it("treats a template with no thinking switch as non-reasoning", async () => {
+    mockLlamaCpp({
+      prompts: { byDefault: QWEN3_THINKING, on: QWEN3_THINKING, off: QWEN3_THINKING },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0]).toMatchObject({ reasoning: false, maxTokens: 8192 });
+    expect(result?.models[0]).not.toHaveProperty("compat");
+    expect(result?.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  // `--reasoning off`: the switch exists, but the server sits on the off
+  // side of it, and Pi has no field that could move it back.
+  it("treats a server started with thinking off as non-reasoning", async () => {
+    mockLlamaCpp({
+      prompts: { byDefault: QWEN3_NO_THINKING, on: QWEN3_THINKING, off: QWEN3_NO_THINKING },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].reasoning).toBe(false);
+    expect(fetch).not.toHaveBeenCalledWith(
+      "http://x/apply-template",
+      expect.objectContaining({ body: expect.stringContaining("reasoning_effort") }),
+    );
+  });
+
+  // /props reports reasoning_format "none" on a server that is splitting
+  // reasoning_content out of every reply (measured on b10692), so that
+  // field must not gate anything.
+  it("ignores the reasoning_format /props reports", async () => {
+    mockLlamaCpp(
+      { prompts: { byDefault: QWEN3_THINKING, on: QWEN3_THINKING, off: QWEN3_NO_THINKING } },
+      { default_generation_settings: { n_ctx: 32768, params: { reasoning_format: "none" } } },
+    );
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].reasoning).toBe(true);
+  });
+
+  it("keeps the safe defaults on a build without /apply-template", async () => {
+    mockLlamaCpp({});
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0]).toMatchObject({ reasoning: false });
+    expect(result?.models[0]).not.toHaveProperty("compat");
+  });
+
+  // A 500 that does not quote a template exception is the server failing,
+  // not the template answering — same all-or-nothing bar as the SGLang sweep.
+  it("keeps reasoning but claims no levels when a tier fails for another reason", async () => {
+    mockLlamaCpp({
+      prompts: { byDefault: QWEN3_THINKING, on: QWEN3_THINKING, off: QWEN3_NO_THINKING },
+      tiers: { ...QWEN38_TEMPLATE_TIERS, medium: "network-error" },
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].reasoning).toBe(true);
+    expect(result?.models[0]).not.toHaveProperty("compat");
+    expect(result?.models[0]).not.toHaveProperty("thinkingLevelMap");
+  });
+
+  it("records a developer role the template rejects", async () => {
+    mockLlamaCpp({
+      prompts: { byDefault: QWEN3_THINKING, on: QWEN3_THINKING, off: QWEN3_NO_THINKING },
+      developer: 500,
+    });
+    const result = await detectLlamaCpp("http://x", "");
+    expect(result?.models[0].compat).toEqual({ supportsReasoningEffort: true, supportsDeveloperRole: false });
+  });
+});
+
 // SGLang's real payloads, trimmed to the fields the detector reads. The
 // /api/* entries are its Ollama compatibility shim, present so the chain
 // tests exercise the ordering that shim makes necessary.
