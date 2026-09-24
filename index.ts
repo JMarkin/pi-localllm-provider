@@ -36,30 +36,28 @@ interface LocalLLMSettings {
   servers: LLMServer[];
 }
 
-// ─── settings.json persistence ────────────────────────────────────
+// ─── localllm.json persistence ────────────────────────────────────
+// Config lives in its own file rather than under a key in settings.json:
+// settings.json is frequently declarative (home-manager/nix symlinks it into
+// a read-only store path), so writing to it either fails outright or loses
+// the next declarative rebuild. Resolved lazily so tests can move $HOME.
 
-const SETTINGS_FILE = path.join(os.homedir(), ".pi", "agent", "settings.json");
-const SETTINGS_KEY = "localllm";
+function configFile(): string {
+  return path.join(os.homedir(), ".pi", "agent", "localllm.json");
+}
 
-function readSettings(): LocalLLMSettings {
+export function readSettings(): LocalLLMSettings {
   try {
-    if (!fs.existsSync(SETTINGS_FILE)) return { servers: [] };
-    const all = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8")) as Record<string, unknown>;
-    return (all[SETTINGS_KEY] as LocalLLMSettings | undefined) ?? { servers: [] };
+    // A missing file is the empty config, not an error — hence no existence check.
+    return JSON.parse(fs.readFileSync(configFile(), "utf8")) as LocalLLMSettings;
   } catch {
     return { servers: [] };
   }
 }
 
-function writeSettings(settings: LocalLLMSettings): void {
-  let all: Record<string, unknown> = {};
-  try {
-    if (fs.existsSync(SETTINGS_FILE)) {
-      all = JSON.parse(fs.readFileSync(SETTINGS_FILE, "utf8")) as Record<string, unknown>;
-    }
-  } catch {}
-  all[SETTINGS_KEY] = settings;
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(all, null, 2), "utf8");
+export function writeSettings(settings: LocalLLMSettings): void {
+  fs.mkdirSync(path.dirname(configFile()), { recursive: true });
+  fs.writeFileSync(configFile(), JSON.stringify(settings, null, 2), "utf8");
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -266,7 +264,7 @@ async function runWizard(
   if (os.platform() === "darwin" && isDirectApiKey(apiKey)) {
     const store = await ctx.ui.confirm(
       "Store API key in macOS Keychain?",
-      "Keeps the raw key out of settings.json — it'll be referenced via a !security command instead.",
+      "Keeps the raw key out of localllm.json — it'll be referenced via a !security command instead.",
     );
     if (store) {
       try {
@@ -275,7 +273,7 @@ async function runWizard(
         ctx.ui.notify("API key stored in Keychain.", "info");
       } catch (err: unknown) {
         ctx.ui.notify(
-          `Failed to store in Keychain, keeping key in settings.json: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to store in Keychain, keeping key in localllm.json: ${err instanceof Error ? err.message : String(err)}`,
           "warning",
         );
       }
@@ -326,7 +324,7 @@ async function runWizard(
 // ─── Manual capability override ────────────────────────────────────
 // Some backends can't be asked whether a model supports vision/reasoning
 // (see detect.ts's vLLM note) — this lets a user fix the tags by hand from
-// the TUI instead of editing settings.json directly. Like any hand edit,
+// the TUI instead of editing localllm.json directly. Like any hand edit,
 // it sticks until the next ↺ Refresh overwrites it with fresh detected
 // values.
 

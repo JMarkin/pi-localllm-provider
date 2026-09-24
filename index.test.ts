@@ -1,5 +1,53 @@
-import { describe, expect, it } from "vitest";
-import { formatModelLine, modelIdsChanged, modelsHeading, normalizeBaseUrl } from "./index.ts";
+import { describe, expect, it, vi } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+  formatModelLine,
+  modelIdsChanged,
+  modelsHeading,
+  normalizeBaseUrl,
+  readSettings,
+  writeSettings,
+} from "./index.ts";
+
+// Config used to live under the "localllm" key in ~/.pi/agent/settings.json,
+// which is often a read-only home-manager symlink. It now has its own file,
+// and settings.json must not be touched at all.
+describe("persistence", () => {
+  it("writes to ~/.pi/agent/localllm.json and never to settings.json", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "localllm-"));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home); // os.homedir() reads this on Windows
+    try {
+      expect(readSettings()).toEqual({ servers: [] });
+
+      writeSettings({
+        servers: [
+          {
+            id: "a3f7k2",
+            name: "Mac Studio",
+            baseUrl: "http://mac-studio.lan:8000/v1",
+            apiKey: "",
+            apiType: "omlx",
+            models: [],
+          },
+        ],
+      });
+
+      const written = JSON.parse(
+        fs.readFileSync(path.join(home, ".pi", "agent", "localllm.json"), "utf8"),
+      );
+      // Top level is the config itself — no "localllm" wrapper key.
+      expect(written.servers[0].name).toBe("Mac Studio");
+      expect(readSettings().servers[0].name).toBe("Mac Studio");
+      expect(fs.existsSync(path.join(home, ".pi", "agent", "settings.json"))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("normalizeBaseUrl", () => {
   it("appends /v1 when missing", () => {

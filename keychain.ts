@@ -1,6 +1,6 @@
 // ─── macOS Keychain integration ────────────────────────────────────
 //
-// Stores raw API keys in the macOS keychain instead of settings.json,
+// Stores raw API keys in the macOS keychain instead of localllm.json,
 // referencing them afterward via Pi's generic "!command" API key format
 // (the same shell-resolved-credential mechanism Pi already supports for
 // any provider's apiKey field).
